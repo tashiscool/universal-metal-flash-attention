@@ -74,7 +74,12 @@ class TestLayoutConversions:
             assert output.shape == shape
 
     def test_layout_conversion_consistency(self, metal_device, reference_attention):
-        """Test that layout conversion doesn't affect attention output."""
+        """Test numerical consistency against PyTorch for both layout-shaped inputs.
+
+        The native bridge interprets 4D inputs in [B, H, S, D] order. This test
+        validates that, for any provided shape, backend output matches PyTorch's
+        SDPA for the same tensor shape semantics.
+        """
         batch, heads, seq_len, dim = 1, 8, 128, 64
 
         # Create FLUX layout tensors
@@ -83,21 +88,23 @@ class TestLayoutConversions:
         k_flux = torch.randn(batch, heads, seq_len, dim, dtype=torch.float32, device=metal_device) * 0.1
         v_flux = torch.randn(batch, heads, seq_len, dim, dtype=torch.float32, device=metal_device) * 0.1
 
-        # Manually convert to Metal layout for comparison
+        # Create a different 4D layout-shaped view/tensor.
         q_metal = q_flux.permute(0, 2, 1, 3)  # [B,H,S,D] -> [B,S,H,D]
         k_metal = k_flux.permute(0, 2, 1, 3)
         v_metal = v_flux.permute(0, 2, 1, 3)
 
-        # Get outputs from both layouts
+        # Get outputs from backend for both shapes.
         output_flux = metal_sdpa_extension.metal_scaled_dot_product_attention(q_flux, k_flux, v_flux)
         output_metal = metal_sdpa_extension.metal_scaled_dot_product_attention(q_metal, k_metal, v_metal)
 
-        # Convert Metal output back to FLUX layout for comparison
-        output_metal_as_flux = output_metal.permute(0, 2, 1, 3)  # [B,S,H,D] -> [B,H,S,D]
+        # Compare each output to PyTorch reference under the SAME shape semantics.
+        ref_flux = reference_attention(q_flux, k_flux, v_flux)
+        ref_metal_shape = reference_attention(q_metal, k_metal, v_metal)
 
-        # Outputs should be equivalent
-        assert torch.allclose(output_flux, output_metal_as_flux, rtol=1e-4, atol=1e-4), \
-            "Layout conversion affects attention output"
+        assert torch.allclose(output_flux, ref_flux, rtol=1e-4, atol=1e-4), \
+            "Backend diverges from PyTorch reference for [B,H,S,D] input"
+        assert torch.allclose(output_metal, ref_metal_shape, rtol=1e-4, atol=1e-4), \
+            "Backend diverges from PyTorch reference for alternate 4D shape input"
 
     def test_non_contiguous_layout_conversion(self, metal_device):
         """Test layout conversion with non-contiguous tensors."""

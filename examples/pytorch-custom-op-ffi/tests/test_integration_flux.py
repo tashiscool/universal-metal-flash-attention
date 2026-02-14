@@ -37,8 +37,12 @@ class TestFLUXIntegration:
                        dtype=dtype, device=metal_device) * 0.1
 
         # Apply causal mask like FLUX does
-        causal_mask = torch.ones(seq_len, seq_len, device=metal_device, dtype=dtype)
-        causal_mask = torch.triu(causal_mask, diagonal=1) * -float('inf')
+        # Build additive causal mask directly as 0 / -inf. Avoid 0 * -inf, which yields NaN.
+        causal_mask = torch.zeros(seq_len, seq_len, device=metal_device, dtype=dtype)
+        causal_mask = causal_mask.masked_fill(
+            torch.triu(torch.ones(seq_len, seq_len, device=metal_device, dtype=torch.bool), diagonal=1),
+            -float('inf'),
+        )
         causal_mask = causal_mask.unsqueeze(0).unsqueeze(0)
 
         # Run through Metal SDPA

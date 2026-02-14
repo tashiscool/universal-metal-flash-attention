@@ -215,3 +215,4 @@ def pytest_configure(config):
     config.addinivalue_line("markers", "flux: Tests specific to FLUX model shapes")
     config.addinivalue_line("markers", "slow: Slow tests that can be skipped")
     config.addinivalue_line("markers", "memory: Tests for memory management")
+    config.addinivalue_line("markers", "regression_gate: Regression gate tests (run before release)")

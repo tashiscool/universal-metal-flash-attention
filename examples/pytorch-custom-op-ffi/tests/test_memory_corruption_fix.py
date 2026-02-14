@@ -32,10 +32,10 @@ def compute_tensor_checksum(tensor: torch.Tensor) -> str:
 
 def create_guard_pattern() -> torch.Tensor:
     """Create a guard pattern tensor to detect memory overwrites."""
-    # Create a distinctive pattern that's easy to verify
+    # Keep values safely representable in both int16 and float16.
     pattern = torch.tensor([
-        0xDEAD, 0xBEEF, 0xCAFE, 0xBABE,
-        0xFEED, 0xFACE, 0xC0DE, 0x1337
+        1024, -1024, 2048, -2048,
+        3072, -3072, 4096, -4096
     ], dtype=torch.int16)
     return pattern
 
@@ -43,19 +43,10 @@ def create_guard_pattern() -> torch.Tensor:
 def verify_guard_pattern(pattern: torch.Tensor) -> bool:
     """Verify that a guard pattern hasn't been corrupted."""
     expected = torch.tensor([
-        0xDEAD, 0xBEEF, 0xCAFE, 0xBABE,
-        0xFEED, 0xFACE, 0xC0DE, 0x1337
-    ], dtype=torch.int16)
-
-    # Handle sign extension for negative values
-    pattern_i32 = pattern.to(torch.int32)
-    expected_i32 = expected.to(torch.int32)
-
-    # Mask to 16-bit values for comparison
-    pattern_masked = pattern_i32 & 0xFFFF
-    expected_masked = expected_i32 & 0xFFFF
-
-    return torch.equal(pattern_masked, expected_masked)
+        1024, -1024, 2048, -2048,
+        3072, -3072, 4096, -4096
+    ], dtype=torch.int16, device=pattern.device)
+    return torch.equal(pattern.to(torch.int16), expected)
 
 
 @pytest.mark.skipif(not HAS_METAL, reason="Metal SDPA extension not available")

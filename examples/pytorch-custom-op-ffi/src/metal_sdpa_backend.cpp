@@ -1042,11 +1042,35 @@ torch::Tensor MetalSDPABackend::call_swift_flash_attention_impl(
     bool had_noncontiguous_qkv = false;
 
     if (q_sizes.size() == 2) {
+        // 2D path: [Nq, D] x [Nkv, D] x [Nkv, D]
+        if (q_sizes[1] != k_sizes[1] || q_sizes[1] != v_sizes[1]) {
+            throw std::runtime_error(
+                "For 2D attention, Q/K/V feature dimension must match: "
+                "expected [N, D] with identical D");
+        }
+        if (k_sizes[0] != v_sizes[0]) {
+            throw std::runtime_error(
+                "For 2D attention, K and V sequence length must match");
+        }
         batch_size = 1;
-        seq_len_q = seq_len_kv = static_cast<uint32_t>(q_sizes[0]);
+        seq_len_q = static_cast<uint32_t>(q_sizes[0]);
+        seq_len_kv = static_cast<uint32_t>(k_sizes[0]);
         num_heads = 1;
         head_dim = static_cast<uint16_t>(q_sizes[1]);
     } else if (q_sizes.size() == 4) {
+        // 4D path: [B, H, N, D]
+        if (q_sizes[0] != k_sizes[0] || q_sizes[0] != v_sizes[0]) {
+            throw std::runtime_error("Batch size mismatch between Q/K/V tensors");
+        }
+        if (q_sizes[1] != k_sizes[1] || q_sizes[1] != v_sizes[1]) {
+            throw std::runtime_error("Head count mismatch between Q/K/V tensors");
+        }
+        if (q_sizes[3] != k_sizes[3] || q_sizes[3] != v_sizes[3]) {
+            throw std::runtime_error("Head dimension mismatch between Q/K/V tensors");
+        }
+        if (k_sizes[2] != v_sizes[2]) {
+            throw std::runtime_error("K/V sequence length mismatch");
+        }
         // PyTorch standard layout: [B, H, S, D]
         // MFA kernel contiguous fallback also assumes [B, H, S, D].
         // Preserve input strides so the stride-aware path remains available.
@@ -1075,9 +1099,20 @@ torch::Tensor MetalSDPABackend::call_swift_flash_attention_impl(
         throw std::runtime_error("Unsupported tensor dimensions. Expected 2D or 4D [batch, heads, seq_len, head_dim]");
     }
 
+    // MFA kernel does NOT natively support BFloat16 inputs — the "bf16" precision
+    // string produces garbage output. Upcast to FP16 for compute, downcast after.
+    auto input_dtype = q_tensor.scalar_type();
+    if (input_dtype == torch::kBFloat16) {
+        q_tensor = q_tensor.to(torch::kFloat16);
+        k_tensor = k_tensor.to(torch::kFloat16);
+        v_tensor = v_tensor.to(torch::kFloat16);
+        if (use_mps_buffers) {
+            torch::mps::synchronize();
+        }
+    }
+
     // MFA kernel ALWAYS writes O as FP32 (device float*), regardless of input precision.
     // See AttentionDescriptor+Precisions.swift: memoryPrecisions[.O] = .FP32
-    auto input_dtype = q_tensor.scalar_type();
     auto output = torch::empty_like(q_tensor, q_tensor.options().dtype(torch::kFloat32));
     auto describe_shape = [](const torch::Tensor& t) {
         std::string s = "[";
@@ -1096,7 +1131,6 @@ torch::Tensor MetalSDPABackend::call_swift_flash_attention_impl(
     switch (q_tensor.scalar_type()) {
         case torch::kFloat16: precision_str = "fp16"; break;
         case torch::kFloat32: precision_str = "fp32"; break;
-        case torch::kBFloat16: precision_str = "bf16"; break;
         default:
             throw std::runtime_error("Unsupported dtype for Metal Flash Attention");
     }
@@ -1121,25 +1155,70 @@ torch::Tensor MetalSDPABackend::call_swift_flash_attention_impl(
     torch::Tensor mask_cpu;
 
     if (attn_mask.has_value() && attn_mask.value().defined()) {
-        mask_cpu = ensure_contiguous_cpu(attn_mask.value());
+        auto raw_mask = attn_mask.value();
+
+        // Broadcast mask to full [B,H,Nq,Nkv] before extracting strides.
+        // expand() is zero-copy: it sets stride=0 for broadcast dims.
+        // The mask prep kernel uses stride-based indexing, so stride=0 gives
+        // correct broadcasting. Without this, a [1,1,Nq,Nkv] mask with
+        // contiguous strides would read out-of-bounds when head > 0.
+        auto ndim = raw_mask.dim();
+        if (ndim == 4) {
+            raw_mask = raw_mask.expand({static_cast<int64_t>(batch_size),
+                                        static_cast<int64_t>(num_heads),
+                                        static_cast<int64_t>(seq_len_q),
+                                        static_cast<int64_t>(seq_len_kv)});
+        } else if (ndim == 3) {
+            raw_mask = raw_mask.expand({static_cast<int64_t>(num_heads),
+                                        static_cast<int64_t>(seq_len_q),
+                                        static_cast<int64_t>(seq_len_kv)});
+        }
+        // 2D [Nq, Nkv] masks need no expansion.
+
+        // Move to CPU. Do NOT call contiguous() — we want the stride=0
+        // from expand() preserved so the kernel handles broadcasting.
+        mask_cpu = raw_mask.cpu();
 
         auto mask_dtype = mask_cpu.scalar_type();
         if (mask_dtype == torch::kBool) {
             // PyTorch bool mask semantics: True=keep, False=masked.
-            // MFABridge bool mask semantics: True=masked, False=keep.
-            // Invert to preserve PyTorch behavior.
-            mask_cpu = ~mask_cpu;
+            // MFABridge mask prep kernel already handles PyTorch convention:
+            //   True (nonzero) → 0.0 (keep), False (zero) → -INFINITY (mask out).
+            // Do NOT invert here — that would double-invert.
             mask_type = MFA_MASK_TYPE_BOOL;
             mask_scalar_type = MFA_MASK_SCALAR_BYTE;
         } else if (mask_dtype == torch::kFloat32) {
+            if (std::abs(softmax_scale) < 1e-12f) {
+                throw std::runtime_error(
+                    "Additive mask with zero softmax scale is unsupported in native bridge; "
+                    "use PyTorch fallback path");
+            }
+            // Native kernel adds external mask before applying softmax scale.
+            // PyTorch SDPA semantics are: (QK * scale) + mask.
+            // Pre-divide mask so kernel computes equivalent logits.
+            mask_cpu = mask_cpu / softmax_scale;
             mask_type = MFA_MASK_TYPE_ADDITIVE;
             mask_scalar_type = MFA_MASK_SCALAR_FP32;
         } else if (mask_dtype == torch::kFloat16) {
+            if (std::abs(softmax_scale) < 1e-12f) {
+                throw std::runtime_error(
+                    "Additive mask with zero softmax scale is unsupported in native bridge; "
+                    "use PyTorch fallback path");
+            }
+            // Match PyTorch semantics: mask should not be multiplied by scale.
+            mask_cpu = mask_cpu / softmax_scale;
             mask_type = MFA_MASK_TYPE_ADDITIVE;
             mask_scalar_type = MFA_MASK_SCALAR_FP16;
         } else if (mask_dtype == torch::kBFloat16) {
+            if (std::abs(softmax_scale) < 1e-12f) {
+                throw std::runtime_error(
+                    "Additive mask with zero softmax scale is unsupported in native bridge; "
+                    "use PyTorch fallback path");
+            }
+            // BF16 mask prep kernel produces garbage on MFA — convert to FP16.
+            mask_cpu = (mask_cpu / softmax_scale).to(torch::kFloat16);
             mask_type = MFA_MASK_TYPE_ADDITIVE;
-            mask_scalar_type = MFA_MASK_SCALAR_BF16;
+            mask_scalar_type = MFA_MASK_SCALAR_FP16;
         } else {
             throw std::runtime_error("Unsupported attn_mask dtype for Metal Flash Attention");
         }
@@ -1397,6 +1476,21 @@ torch::Tensor MetalSDPABackend::scaled_dot_product_attention(
             // Default: 1/sqrt(head_dim)
             int head_dim = query.size(-1);
             softmax_scale = 1.0f / std::sqrt(static_cast<float>(head_dim));
+        }
+
+        // macOS 26: native bridge BF16 path is not yet numerically reliable.
+        // Route BF16 tensors to PyTorch SDPA for correctness.
+        if (query.scalar_type() == torch::kBFloat16 ||
+            key.scalar_type() == torch::kBFloat16 ||
+            value.scalar_type() == torch::kBFloat16) {
+            return fallback_to_native_sdpa(
+                query,
+                key,
+                value,
+                attn_mask,
+                is_causal,
+                softmax_scale,
+                "bf16_routed_to_torch_native");
         }
 
         // Runtime rollout control: disable native bridge without rebuild.

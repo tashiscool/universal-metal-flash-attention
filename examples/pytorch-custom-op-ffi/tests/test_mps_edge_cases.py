@@ -265,17 +265,15 @@ class TestMPSErrorRecovery:
 
     def test_recovery_after_error(self, metal_device):
         """Test that we can continue using Metal SDPA after an error."""
-        # First, try something that might fail
-        try:
-            # Intentionally problematic size
-            q_bad = torch.randn(1, 1, 100000, 128, dtype=torch.float16, device=metal_device)
-            k_bad = torch.randn(1, 1, 100000, 128, dtype=torch.float16, device=metal_device)
-            v_bad = torch.randn(1, 1, 100000, 128, dtype=torch.float16, device=metal_device)
-
-            output_bad = metal_sdpa_extension.metal_scaled_dot_product_attention(q_bad, k_bad, v_bad)
-        except:
-            # Expected to fail
-            pass
+        # First, trigger a deterministic RuntimeError (invalid mask dtype).
+        q_bad = torch.randn(1, 1, 32, 64, dtype=torch.float16, device=metal_device)
+        k_bad = torch.randn(1, 1, 32, 64, dtype=torch.float16, device=metal_device)
+        v_bad = torch.randn(1, 1, 32, 64, dtype=torch.float16, device=metal_device)
+        bad_mask = torch.ones(1, 1, 32, 32, dtype=torch.int32, device=metal_device)
+        with pytest.raises(RuntimeError):
+            metal_sdpa_extension.metal_scaled_dot_product_attention(
+                q_bad, k_bad, v_bad, attn_mask=bad_mask
+            )
 
         # Clean up
         torch.mps.empty_cache()
