@@ -1000,16 +1000,13 @@ torch::Tensor MetalSDPABackend::call_swift_flash_attention_impl(
         throw std::runtime_error("Unsupported tensor dimensions. Expected 2D (seq_len, head_dim) or 4D (batch, seq_len, num_heads, head_dim)");
     }
 
-    // Safety policy: low-precision multi-head in the native bridge is currently
-    // unstable on macOS 26 for some valid WAN/ComfyUI shapes. Fail fast so
-    // higher-level routing can switch to stable backends.
-    const bool allow_low_precision = env_truthy("MFA_NATIVE_ALLOW_LOW_PRECISION", false);
-    const bool low_precision_input =
-        (q_tensor.scalar_type() == torch::kFloat16 || q_tensor.scalar_type() == torch::kBFloat16);
-    if (!allow_low_precision && q_sizes.size() == 4 && num_heads > 1 && low_precision_input) {
+    // Safety policy: 4D path remains experimental on macOS 26.
+    // Disable by default to avoid silently returning incorrect outputs.
+    const bool allow_4d = env_truthy("MFA_NATIVE_ALLOW_4D_EXPERIMENTAL", false);
+    if (q_sizes.size() == 4 && !allow_4d) {
         throw std::runtime_error(
-            "MFABridge low-precision multi-head disabled for stability on macOS 26; "
-            "set MFA_NATIVE_ALLOW_LOW_PRECISION=1 to bypass."
+            "MFABridge 4D path is disabled by default on macOS 26 "
+            "(set MFA_NATIVE_ALLOW_4D_EXPERIMENTAL=1 to bypass)."
         );
     }
 
