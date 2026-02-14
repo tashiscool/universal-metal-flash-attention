@@ -141,9 +141,11 @@ kernel void mfa_prepare_mask(
 
       switch (mask_type) {
       case 1u: {
+        // PyTorch SDPA convention: True = participate in attention (keep).
+        // So True → 0.0 (no change) and False → -INFINITY (mask out).
         const device uchar* bool_ptr = mask_raw;
-        bool masked = bool_ptr[linear_index] != 0;
-        mask_value = masked ? -INFINITY : 0.0f;
+        bool keep = bool_ptr[linear_index] != 0;
+        mask_value = keep ? 0.0f : -INFINITY;
         break;
       }
       case 2u: {

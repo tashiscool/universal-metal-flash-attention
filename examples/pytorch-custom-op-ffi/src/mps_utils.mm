@@ -3,6 +3,7 @@
 #if defined(__APPLE__)
 #import <Metal/Metal.h>
 #include <ATen/native/mps/OperationUtils.h>
+#include <ATen/mps/MPSStream.h>
 
 namespace metal_sdpa {
 namespace mps_utils {
@@ -23,6 +24,16 @@ void* get_mtl_buffer_handle(const at::Tensor& tensor) {
     return (__bridge void*)buffer;
 }
 
+size_t get_storage_offset_bytes(const at::Tensor& tensor) {
+    return static_cast<size_t>(tensor.storage_offset()) * tensor.element_size();
+}
+
+void synchronize_mps() {
+    @autoreleasepool {
+        at::mps::getDefaultMPSStream()->synchronize(at::mps::SyncType::COMMIT_AND_WAIT);
+    }
+}
+
 } // namespace mps_utils
 } // namespace metal_sdpa
 
@@ -37,6 +48,14 @@ bool is_mps_tensor(const at::Tensor&) {
 
 void* get_mtl_buffer_handle(const at::Tensor&) {
     return nullptr;
+}
+
+size_t get_storage_offset_bytes(const at::Tensor&) {
+    return 0;
+}
+
+void synchronize_mps() {
+    // No-op on non-Apple platforms
 }
 
 } // namespace mps_utils

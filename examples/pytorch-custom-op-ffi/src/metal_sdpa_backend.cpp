@@ -963,6 +963,7 @@ torch::Tensor MetalSDPABackend::call_swift_flash_attention_impl(
 
     uint32_t batch_size, seq_len_q, seq_len_kv, num_heads;
     uint16_t head_dim;
+    bool had_noncontiguous_qkv = false;
 
     if (q_sizes.size() == 2) {
         batch_size = 1;
@@ -972,16 +973,25 @@ torch::Tensor MetalSDPABackend::call_swift_flash_attention_impl(
     } else if (q_sizes.size() == 4) {
         // PyTorch standard layout: [B, H, S, D]
         // MFA kernel contiguous fallback also assumes [B, H, S, D].
-        // No layout conversion needed — just ensure contiguous.
+        // Preserve input strides so the stride-aware path remains available.
         batch_size = static_cast<uint32_t>(q_sizes[0]);
         num_heads = static_cast<uint32_t>(q_sizes[1]);
         seq_len_q = static_cast<uint32_t>(q_sizes[2]);
         seq_len_kv = static_cast<uint32_t>(k_sizes[2]);
         head_dim = static_cast<uint16_t>(q_sizes[3]);
+        had_noncontiguous_qkv =
+            (!q_tensor.is_contiguous() || !k_tensor.is_contiguous() || !v_tensor.is_contiguous());
 
-        q_tensor = q_tensor.contiguous();
-        k_tensor = k_tensor.contiguous();
-        v_tensor = v_tensor.contiguous();
+        // Current native kernel path assumes contiguous inner head-dim access.
+        // Normalize non-contiguous Q/K/V into contiguous buffers for correctness.
+        if (had_noncontiguous_qkv) {
+            q_tensor = q_tensor.contiguous();
+            k_tensor = k_tensor.contiguous();
+            v_tensor = v_tensor.contiguous();
+            if (use_mps_buffers) {
+                torch::mps::synchronize();
+            }
+        }
 
         printf("📊 Attention dimensions: batch=%u, heads=%u, seq_q=%u, seq_kv=%u, dim=%u\n",
                batch_size, num_heads, seq_len_q, seq_len_kv, head_dim);
@@ -992,7 +1002,7 @@ torch::Tensor MetalSDPABackend::call_swift_flash_attention_impl(
     // MFA kernel ALWAYS writes O as FP32 (device float*), regardless of input precision.
     // See AttentionDescriptor+Precisions.swift: memoryPrecisions[.O] = .FP32
     auto input_dtype = q_tensor.scalar_type();
-    auto output = torch::empty(q_tensor.sizes(), q_tensor.options().dtype(torch::kFloat32));
+    auto output = torch::empty_like(q_tensor, q_tensor.options().dtype(torch::kFloat32));
     auto describe_shape = [](const torch::Tensor& t) {
         std::string s = "[";
         for (int64_t i = 0; i < t.dim(); ++i) {
@@ -1039,6 +1049,10 @@ torch::Tensor MetalSDPABackend::call_swift_flash_attention_impl(
 
         auto mask_dtype = mask_cpu.scalar_type();
         if (mask_dtype == torch::kBool) {
+            // PyTorch bool mask semantics: True=keep, False=masked.
+            // MFABridge bool mask semantics: True=masked, False=keep.
+            // Invert to preserve PyTorch behavior.
+            mask_cpu = ~mask_cpu;
             mask_type = MFA_MASK_TYPE_BOOL;
             mask_scalar_type = MFA_MASK_SCALAR_BYTE;
         } else if (mask_dtype == torch::kFloat32) {
@@ -1090,7 +1104,19 @@ torch::Tensor MetalSDPABackend::call_swift_flash_attention_impl(
 
     mfa_buffer_t q_buffer = nullptr, k_buffer = nullptr, v_buffer = nullptr, out_buffer = nullptr;
 
-    auto bind_tensor = [&](const char* name, const torch::Tensor& tensor, mfa_buffer_t& buffer) {
+    // bind_tensor: wraps a PyTorch tensor into an MFA buffer.
+    // For MPS zero-copy path, we must guarantee storage_offset==0 because
+    // mfa_buffer_from_mtl_buffer binds the whole MTLBuffer starting at byte 0.
+    // The lambda captures `use_mps_buffers` by reference from the outer scope.
+    auto bind_tensor = [&](const char* name, torch::Tensor tensor, mfa_buffer_t& buffer) {
+        // Safety: if MPS tensor has non-zero storage offset within its MTLBuffer,
+        // clone to get a fresh allocation at offset 0.
+        if (use_mps_buffers && tensor.storage_offset() != 0) {
+            printf("⚠️  %s: storage_offset=%lld, cloning to offset-0 buffer\n",
+                   name, static_cast<long long>(tensor.storage_offset()));
+            tensor = tensor.clone();
+        }
+
         size_t bytes = tensor.numel() * tensor.element_size();
         mfa_error_t result = MFA_SUCCESS;
 
@@ -1207,7 +1233,15 @@ torch::Tensor MetalSDPABackend::call_swift_flash_attention(
     bool mps_candidate = q.device().is_mps() && k.device().is_mps() && v.device().is_mps();
     if (mps_candidate) {
         try {
-            return call_swift_flash_attention_impl(q, k, v, attn_mask, is_causal, softmax_scale, true);
+            // Fence upstream MPS work before exporting raw MTLBuffer handles.
+            // Without this, .contiguous() copies and prior graph ops may not have
+            // committed their results, causing stale/zero reads.
+            mps_utils::synchronize_mps();
+            auto result = call_swift_flash_attention_impl(q, k, v, attn_mask, is_causal, softmax_scale, true);
+            // Ensure our native command buffer writes are visible to subsequent
+            // PyTorch MPS ops that will read the output tensor.
+            mps_utils::synchronize_mps();
+            return result;
         } catch (const std::exception& ex) {
             std::cout << "⚠️  MPS fast path unavailable: " << ex.what() << " -- falling back to CPU path" << std::endl;
         }

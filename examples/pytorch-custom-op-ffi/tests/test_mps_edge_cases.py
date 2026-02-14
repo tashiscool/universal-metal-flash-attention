@@ -131,7 +131,8 @@ class TestMPSMemoryAlignment:
     def test_strided_tensor_access(self, metal_device):
         """Test with strided (non-contiguous) tensors."""
         # Create strided tensors via slicing
-        base = torch.randn(2, 8, 128, 64, dtype=torch.float16, device=metal_device) * 0.1
+        # Use 3 batches so [::2] keeps more than one slice and remains genuinely strided.
+        base = torch.randn(3, 8, 128, 64, dtype=torch.float16, device=metal_device) * 0.1
 
         # Use every other batch
         q = base[::2]  # Strided in batch dimension
