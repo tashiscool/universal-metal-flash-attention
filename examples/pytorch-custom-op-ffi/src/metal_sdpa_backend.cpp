@@ -13,6 +13,7 @@
 #include <algorithm>  // For std::clamp
 #include <cstdlib>    // For std::getenv
 #include <cctype>     // For std::tolower
+#include <string>
 
 namespace metal_sdpa {
 
@@ -128,6 +129,81 @@ std::string scalar_type_to_string(torch::ScalarType type) {
         case torch::ScalarType::QInt32: return "QInt32";
         default: return "Unknown";
     }
+}
+
+bool env_flag_enabled(const char* name, bool default_value) {
+    const char* raw = std::getenv(name);
+    if (!raw) return default_value;
+    std::string value(raw);
+    std::transform(value.begin(), value.end(), value.begin(), [](unsigned char c) {
+        return static_cast<char>(std::tolower(c));
+    });
+    if (value == "1" || value == "true" || value == "yes" || value == "on") return true;
+    if (value == "0" || value == "false" || value == "no" || value == "off") return false;
+    return default_value;
+}
+
+std::string shape_to_string(const torch::Tensor& tensor) {
+    std::string out = "[";
+    for (int64_t i = 0; i < tensor.dim(); ++i) {
+        out += std::to_string(tensor.size(i));
+        if (i + 1 < tensor.dim()) out += ",";
+    }
+    out += "]";
+    return out;
+}
+
+std::string mask_to_string(const c10::optional<torch::Tensor>& attn_mask) {
+    if (!attn_mask.has_value() || !attn_mask.value().defined()) {
+        return "none";
+    }
+    return scalar_type_to_string(attn_mask.value().scalar_type());
+}
+
+void log_attention_route(
+    const std::string& backend,
+    const std::string& reason,
+    const torch::Tensor& q,
+    const torch::Tensor& k,
+    const torch::Tensor& v,
+    const c10::optional<torch::Tensor>& attn_mask,
+    bool is_causal,
+    float softmax_scale
+) {
+    std::cout
+        << "[METAL_NATIVE_SDPA_ROUTE] backend=" << backend
+        << " reason=" << reason
+        << " device=" << q.device()
+        << " dtype=" << scalar_type_to_string(q.scalar_type())
+        << " q=" << shape_to_string(q)
+        << " k=" << shape_to_string(k)
+        << " v=" << shape_to_string(v)
+        << " mask=" << mask_to_string(attn_mask)
+        << " causal=" << (is_causal ? 1 : 0)
+        << " scale=" << softmax_scale
+        << std::endl;
+}
+
+torch::Tensor fallback_to_native_sdpa(
+    const torch::Tensor& q,
+    const torch::Tensor& k,
+    const torch::Tensor& v,
+    const c10::optional<torch::Tensor>& attn_mask,
+    bool is_causal,
+    float softmax_scale,
+    const std::string& reason
+) {
+    log_attention_route("torch_native_sdpa", reason, q, k, v, attn_mask, is_causal, softmax_scale);
+    return at::native::scaled_dot_product_attention(
+        q,
+        k,
+        v,
+        attn_mask,
+        0.0,
+        is_causal,
+        c10::optional<double>(static_cast<double>(softmax_scale)),
+        false
+    );
 }
 
 // Convert FLUX layout [B,H,S,D] to Metal layout [B,S,H,D]
@@ -1230,6 +1306,11 @@ torch::Tensor MetalSDPABackend::call_swift_flash_attention(
     bool is_causal,
     float softmax_scale
 ) {
+    if (!env_flag_enabled("METAL_NATIVE_SDPA_ENABLED", true)) {
+        return fallback_to_native_sdpa(
+            q, k, v, attn_mask, is_causal, softmax_scale, "env_disabled");
+    }
+
     bool mps_candidate = q.device().is_mps() && k.device().is_mps() && v.device().is_mps();
     if (mps_candidate) {
         try {
@@ -1241,9 +1322,17 @@ torch::Tensor MetalSDPABackend::call_swift_flash_attention(
             // Ensure our native command buffer writes are visible to subsequent
             // PyTorch MPS ops that will read the output tensor.
             mps_utils::synchronize_mps();
+            log_attention_route("native_swift_mps", "ok", q, k, v, attn_mask, is_causal, softmax_scale);
             return result;
         } catch (const std::exception& ex) {
-            std::cout << "⚠️  MPS fast path unavailable: " << ex.what() << " -- falling back to CPU path" << std::endl;
+            return fallback_to_native_sdpa(
+                q,
+                k,
+                v,
+                attn_mask,
+                is_causal,
+                softmax_scale,
+                std::string("native_exception:") + ex.what());
         }
     }
 
@@ -1254,7 +1343,9 @@ torch::Tensor MetalSDPABackend::call_swift_flash_attention(
     if (attn_mask.has_value()) {
         mask_cpu = ensure_contiguous_cpu(attn_mask.value());
     }
-    return call_swift_flash_attention_impl(q_cpu, k_cpu, v_cpu, mask_cpu, is_causal, softmax_scale, false);
+    auto result = call_swift_flash_attention_impl(q_cpu, k_cpu, v_cpu, mask_cpu, is_causal, softmax_scale, false);
+    log_attention_route("native_swift_cpu", "non_mps_inputs", q, k, v, attn_mask, is_causal, softmax_scale);
+    return result;
 }
 
 
@@ -1269,76 +1360,107 @@ torch::Tensor MetalSDPABackend::scaled_dot_product_attention(
     bool enable_gqa
 ) {
     try {
-        // Ensure backend is initialized
-        ensure_initialized();
+        // Validate inputs
+        if (dropout_p > 0.0) {
+            std::cout << "Warning: Dropout not supported in Metal Flash Attention, ignoring dropout_p" << std::endl;
+        }
 
-    // Validate inputs
-    if (dropout_p > 0.0) {
-        std::cout << "Warning: Dropout not supported in Metal Flash Attention, ignoring dropout_p" << std::endl;
-    }
+        if (attn_mask.has_value() && attn_mask.value().defined()) {
+            auto mask_dtype = attn_mask.value().scalar_type();
+            if (mask_dtype != torch::kBool &&
+                mask_dtype != torch::kFloat32 &&
+                mask_dtype != torch::kFloat16 &&
+                mask_dtype != torch::kBFloat16) {
+                float fallback_scale = scale.has_value()
+                    ? static_cast<float>(scale.value())
+                    : (1.0f / std::sqrt(static_cast<float>(query.size(-1))));
+                return fallback_to_native_sdpa(
+                    query,
+                    key,
+                    value,
+                    attn_mask,
+                    is_causal,
+                    fallback_scale,
+                    "unsupported_mask_dtype");
+            }
+        }
 
-    if (attn_mask.has_value() && attn_mask.value().defined()) {
-        auto mask_dtype = attn_mask.value().scalar_type();
-        if (mask_dtype != torch::kBool &&
-            mask_dtype != torch::kFloat32 &&
-            mask_dtype != torch::kFloat16 &&
-            mask_dtype != torch::kBFloat16) {
-            std::cout << "⚠️  Unsupported attention mask dtype for Metal backend, using PyTorch reference implementation" << std::endl;
-            return at::native::scaled_dot_product_attention(
+        if (enable_gqa) {
+            std::cout << "Warning: Grouped Query Attention (GQA) not yet supported, ignoring enable_gqa flag" << std::endl;
+        }
+
+        // Calculate softmax scale
+        float softmax_scale = 1.0f;
+        if (scale.has_value()) {
+            softmax_scale = static_cast<float>(scale.value());
+        } else {
+            // Default: 1/sqrt(head_dim)
+            int head_dim = query.size(-1);
+            softmax_scale = 1.0f / std::sqrt(static_cast<float>(head_dim));
+        }
+
+        // Runtime rollout control: disable native bridge without rebuild.
+        if (!env_flag_enabled("METAL_NATIVE_SDPA_ENABLED", true)) {
+            return fallback_to_native_sdpa(
                 query,
                 key,
                 value,
                 attn_mask,
-                dropout_p,
                 is_causal,
-                scale,
-                enable_gqa
-            );
+                softmax_scale,
+                "env_disabled");
         }
-    }
 
-    if (enable_gqa) {
-        std::cout << "Warning: Grouped Query Attention (GQA) not yet supported, ignoring enable_gqa flag" << std::endl;
-    }
+        // Ensure backend is initialized only when native path is enabled.
+        ensure_initialized();
 
-    // Calculate softmax scale
-    float softmax_scale = 1.0f;
-    if (scale.has_value()) {
-        softmax_scale = static_cast<float>(scale.value());
-    } else {
-        // Default: 1/sqrt(head_dim)
-        int head_dim = query.size(-1);
-        softmax_scale = 1.0f / std::sqrt(static_cast<float>(head_dim));
-    }
+        // Store original device and dtype
+        auto orig_device = query.device();
+        auto orig_dtype = query.scalar_type();
 
-    // Store original device and dtype
-    auto orig_device = query.device();
-    auto orig_dtype = query.scalar_type();
+        // Call Swift Flash Attention (using processed tensors from call_swift_flash_attention)
+        auto result = call_swift_flash_attention(query, key, value, attn_mask, is_causal, softmax_scale);
 
-    // Call Swift Flash Attention (using processed tensors from call_swift_flash_attention)
-    auto result = call_swift_flash_attention(query, key, value, attn_mask, is_causal, softmax_scale);
+        // Convert result back to original layout if input was FLUX
+        // Note: The layout conversion is now handled within call_swift_flash_attention
+        // This just preserves the original logic structure for future reference
 
-    // Convert result back to original layout if input was FLUX
-    // Note: The layout conversion is now handled within call_swift_flash_attention
-    // This just preserves the original logic structure for future reference
+        // Move result back to original device if needed
+        if (result.device() != orig_device) {
+            result = result.to(orig_device);
+        }
 
-    // Move result back to original device if needed
-    if (result.device() != orig_device) {
-        result = result.to(orig_device);
-    }
+        // Convert to original dtype if needed
+        if (result.scalar_type() != orig_dtype) {
+            result = result.to(orig_dtype);
+        }
 
-    // Convert to original dtype if needed
-    if (result.scalar_type() != orig_dtype) {
-        result = result.to(orig_dtype);
-    }
-
-    return result;
+        return result;
 
     } catch (const std::exception& e) {
-        // Re-throw with more context to prevent silent crashes
-        throw std::runtime_error(std::string("Metal SDPA Backend Error: ") + e.what());
+        float fallback_scale = scale.has_value()
+            ? static_cast<float>(scale.value())
+            : (1.0f / std::sqrt(static_cast<float>(query.size(-1))));
+        return fallback_to_native_sdpa(
+            query,
+            key,
+            value,
+            attn_mask,
+            is_causal,
+            fallback_scale,
+            std::string("top_level_exception:") + e.what());
     } catch (...) {
-        throw std::runtime_error("Metal SDPA Backend: Unknown error occurred");
+        float fallback_scale = scale.has_value()
+            ? static_cast<float>(scale.value())
+            : (1.0f / std::sqrt(static_cast<float>(query.size(-1))));
+        return fallback_to_native_sdpa(
+            query,
+            key,
+            value,
+            attn_mask,
+            is_causal,
+            fallback_scale,
+            "top_level_unknown_exception");
     }
 }
 
