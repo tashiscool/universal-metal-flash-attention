@@ -953,16 +953,6 @@ torch::Tensor MetalSDPABackend::call_swift_flash_attention_impl(
     float softmax_scale,
     bool use_mps_buffers
 ) {
-    auto env_truthy = [](const char* name, bool default_value) -> bool {
-        const char* raw = std::getenv(name);
-        if (!raw) return default_value;
-        std::string value(raw);
-        std::transform(value.begin(), value.end(), value.begin(), [](unsigned char c) {
-            return static_cast<char>(std::tolower(c));
-        });
-        return (value == "1" || value == "true" || value == "yes" || value == "on");
-    };
-
     auto q_sizes = q_tensor.sizes();
     auto k_sizes = k_tensor.sizes();
     auto v_sizes = v_tensor.sizes();
@@ -973,7 +963,6 @@ torch::Tensor MetalSDPABackend::call_swift_flash_attention_impl(
 
     uint32_t batch_size, seq_len_q, seq_len_kv, num_heads;
     uint16_t head_dim;
-    bool input_was_flux = false;
 
     if (q_sizes.size() == 2) {
         batch_size = 1;
@@ -981,36 +970,29 @@ torch::Tensor MetalSDPABackend::call_swift_flash_attention_impl(
         num_heads = 1;
         head_dim = static_cast<uint16_t>(q_sizes[1]);
     } else if (q_sizes.size() == 4) {
-        printf("📋 Converting PyTorch layout [B,H,S,D] to Metal layout [B,S,H,D]\n");
-        q_tensor = convert_flux_to_metal_layout(q_tensor);
-        k_tensor = convert_flux_to_metal_layout(k_tensor);
-        v_tensor = convert_flux_to_metal_layout(v_tensor);
-        input_was_flux = true;
+        // PyTorch standard layout: [B, H, S, D]
+        // MFA kernel contiguous fallback also assumes [B, H, S, D].
+        // No layout conversion needed — just ensure contiguous.
+        batch_size = static_cast<uint32_t>(q_sizes[0]);
+        num_heads = static_cast<uint32_t>(q_sizes[1]);
+        seq_len_q = static_cast<uint32_t>(q_sizes[2]);
+        seq_len_kv = static_cast<uint32_t>(k_sizes[2]);
+        head_dim = static_cast<uint16_t>(q_sizes[3]);
 
-        auto q_metal_sizes = q_tensor.sizes();
-        batch_size = static_cast<uint32_t>(q_metal_sizes[0]);
-        seq_len_q = static_cast<uint32_t>(q_metal_sizes[1]);
-        seq_len_kv = static_cast<uint32_t>(k_tensor.sizes()[1]);
-        num_heads = static_cast<uint32_t>(q_metal_sizes[2]);
-        head_dim = static_cast<uint16_t>(q_metal_sizes[3]);
+        q_tensor = q_tensor.contiguous();
+        k_tensor = k_tensor.contiguous();
+        v_tensor = v_tensor.contiguous();
 
-        printf("📊 Regular attention dimensions: batch=%u, seq_q=%u, seq_kv=%u, heads=%u, dim=%u\n",
-               batch_size, seq_len_q, seq_len_kv, num_heads, head_dim);
+        printf("📊 Attention dimensions: batch=%u, heads=%u, seq_q=%u, seq_kv=%u, dim=%u\n",
+               batch_size, num_heads, seq_len_q, seq_len_kv, head_dim);
     } else {
-        throw std::runtime_error("Unsupported tensor dimensions. Expected 2D (seq_len, head_dim) or 4D (batch, seq_len, num_heads, head_dim)");
+        throw std::runtime_error("Unsupported tensor dimensions. Expected 2D or 4D [batch, heads, seq_len, head_dim]");
     }
 
-    // Safety policy: 4D path remains experimental on macOS 26.
-    // Disable by default to avoid silently returning incorrect outputs.
-    const bool allow_4d = env_truthy("MFA_NATIVE_ALLOW_4D_EXPERIMENTAL", false);
-    if (q_sizes.size() == 4 && !allow_4d) {
-        throw std::runtime_error(
-            "MFABridge 4D path is disabled by default on macOS 26 "
-            "(set MFA_NATIVE_ALLOW_4D_EXPERIMENTAL=1 to bypass)."
-        );
-    }
-
-    auto output = torch::empty_like(q_tensor);
+    // MFA kernel ALWAYS writes O as FP32 (device float*), regardless of input precision.
+    // See AttentionDescriptor+Precisions.swift: memoryPrecisions[.O] = .FP32
+    auto input_dtype = q_tensor.scalar_type();
+    auto output = torch::empty(q_tensor.sizes(), q_tensor.options().dtype(torch::kFloat32));
     auto describe_shape = [](const torch::Tensor& t) {
         std::string s = "[";
         for (int64_t i = 0; i < t.dim(); ++i) {
@@ -1182,7 +1164,7 @@ torch::Tensor MetalSDPABackend::call_swift_flash_attention_impl(
         q_buffer, k_buffer, v_buffer, out_buffer,
         batch_size, seq_len_q, seq_len_kv, num_heads, head_dim,
         softmax_scale, is_causal,
-        precision_str.c_str(), precision_str.c_str(), precision_str.c_str(),
+        precision_str.c_str(), precision_str.c_str(), "fp32", // output always FP32
         false, false, false, false,
         mask_ptr,
         mask_size_bytes,
@@ -1206,9 +1188,9 @@ torch::Tensor MetalSDPABackend::call_swift_flash_attention_impl(
         throw std::runtime_error(error_msg);
     }
 
-    if (input_was_flux) {
-        printf("🔄 Converting output from Metal layout [B,S,H,D] back to PyTorch layout [B,H,S,D]\n");
-        output = convert_metal_to_flux_layout(output);
+    // Convert FP32 kernel output back to original input dtype
+    if (output.scalar_type() != input_dtype) {
+        output = output.to(input_dtype);
     }
 
     return output;
