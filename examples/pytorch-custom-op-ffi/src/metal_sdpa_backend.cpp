@@ -11,6 +11,8 @@
 #include <cinttypes>  // For PRId64, PRIu32, etc.
 #include <cmath>      // For std::isfinite, std::clamp
 #include <algorithm>  // For std::clamp
+#include <cstdlib>    // For std::getenv
+#include <cctype>     // For std::tolower
 
 namespace metal_sdpa {
 
@@ -951,6 +953,16 @@ torch::Tensor MetalSDPABackend::call_swift_flash_attention_impl(
     float softmax_scale,
     bool use_mps_buffers
 ) {
+    auto env_truthy = [](const char* name, bool default_value) -> bool {
+        const char* raw = std::getenv(name);
+        if (!raw) return default_value;
+        std::string value(raw);
+        std::transform(value.begin(), value.end(), value.begin(), [](unsigned char c) {
+            return static_cast<char>(std::tolower(c));
+        });
+        return (value == "1" || value == "true" || value == "yes" || value == "on");
+    };
+
     auto q_sizes = q_tensor.sizes();
     auto k_sizes = k_tensor.sizes();
     auto v_sizes = v_tensor.sizes();
@@ -986,6 +998,19 @@ torch::Tensor MetalSDPABackend::call_swift_flash_attention_impl(
                batch_size, seq_len_q, seq_len_kv, num_heads, head_dim);
     } else {
         throw std::runtime_error("Unsupported tensor dimensions. Expected 2D (seq_len, head_dim) or 4D (batch, seq_len, num_heads, head_dim)");
+    }
+
+    // Safety policy: low-precision multi-head in the native bridge is currently
+    // unstable on macOS 26 for some valid WAN/ComfyUI shapes. Fail fast so
+    // higher-level routing can switch to stable backends.
+    const bool allow_low_precision = env_truthy("MFA_NATIVE_ALLOW_LOW_PRECISION", false);
+    const bool low_precision_input =
+        (q_tensor.scalar_type() == torch::kFloat16 || q_tensor.scalar_type() == torch::kBFloat16);
+    if (!allow_low_precision && q_sizes.size() == 4 && num_heads > 1 && low_precision_input) {
+        throw std::runtime_error(
+            "MFABridge low-precision multi-head disabled for stability on macOS 26; "
+            "set MFA_NATIVE_ALLOW_LOW_PRECISION=1 to bypass."
+        );
     }
 
     auto output = torch::empty_like(q_tensor);

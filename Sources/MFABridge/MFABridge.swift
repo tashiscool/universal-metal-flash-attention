@@ -184,6 +184,13 @@ kernel void mfa_prepare_mask(
 }
 """
 
+  // Compile options requiring Metal 3.1+ for bfloat support
+  let compileOptions: MTLCompileOptions = {
+    let opts = MTLCompileOptions()
+    opts.languageVersion = .version3_1
+    return opts
+  }()
+
   init?(device: MTLDevice) {
     self.device = device
     guard let queue = device.makeCommandQueue() else {
@@ -206,7 +213,7 @@ kernel void mfa_prepare_mask(
     }
 
     do {
-      let library = try device.makeLibrary(source: Self.maskKernelSource, options: nil)
+      let library = try device.makeLibrary(source: Self.maskKernelSource, options: compileOptions)
       guard let function = library.makeFunction(name: "mfa_prepare_mask") else {
         throw MaskPreparationError.pipelineCreationFailed
       }
@@ -721,7 +728,7 @@ public func mfa_attention_forward(
   _ k: UnsafeMutableRawPointer?,
   _ v: UnsafeMutableRawPointer?,
   _ out: UnsafeMutableRawPointer?,
-  _: UInt32,
+  _ batchSize: UInt32,
   _ seqLenQ: UInt32,
   _ seqLenKV: UInt32,
   _ numHeads: UInt32,
@@ -788,7 +795,7 @@ public func mfa_attention_forward(
   do {
     preparedMask = try mfaContext.prepareMask(
       arguments: maskArguments,
-      batchSize: 1,
+      batchSize: batchSize,
       numHeads: numHeads,
       seqLenQ: seqLenQ,
       seqLenKV: seqLenKV
@@ -813,30 +820,10 @@ public func mfa_attention_forward(
     return 5
   }
 
-  // Handle multi-head attention using the new MultiHeadAttention implementation
-  if numHeads > 1 {
-    return mfa_attention_forward_multihead_internal(
-      context: mfaContext,
-      qBuffer: qBuffer.buffer,
-      kBuffer: kBuffer.buffer,
-      vBuffer: vBuffer.buffer,
-      outBuffer: outBuffer.buffer,
-      batchSize: 1, // For now, assume batch size 1 for FFI compatibility
-      seqLenQ: seqLenQ,
-      seqLenKV: seqLenKV,
-      numHeads: numHeads,
-      headDim: headDim,
-      softmaxScale: softmaxScale,
-      causal: causal,
-      inputPrecision: inputPrecision,
-      intermediatePrecision: intermediatePrecision,
-      transposeQ: transposeQ,
-      transposeK: transposeK,
-      transposeV: transposeV,
-      transposeO: transposeO,
-      preparedMask: preparedMask
-    )
-  }
+  // NOTE:
+  // Keep all head counts on the same direct path below.
+  // The MultiHeadAttention helper currently has a buffer binding layout mismatch
+  // with generated attention kernels, which can produce non-finite outputs.
 
   do {
     // Create cache key for pipeline deduplication
@@ -867,16 +854,12 @@ public func mfa_attention_forward(
       descriptor.softmaxScale = softmaxScale
 
       // Set precision based on input parameters
-      // Convert C FFI enum values to Swift values
-      let swiftInputPrecision = convertCFFIPrecisionToSwift(inputPrecision)
-      let swiftIntermediatePrecision = convertCFFIPrecisionToSwift(intermediatePrecision)
-
-      // IMPORTANT: When using FP16/BF16 precision modes with FP32 data,
-      // we must use FP32 inputs to avoid NaN issues from precision mismatch
-      // The inputs are always FP32 from the FFI layer
-      descriptor.lowPrecisionInputs = false
-      // Use FP32 intermediates for numerical stability
-      descriptor.lowPrecisionIntermediates = false
+      // C FFI: FP16=0, BF16=1, FP32=2
+      // lowPrecisionInputs=true → kernel uses half* buffers (FP16 input)
+      // lowPrecisionInputs=false → kernel uses float* buffers (FP32 input)
+      let isLowPrecisionInput = (inputPrecision == 0 || inputPrecision == 1) // FP16 or BF16
+      descriptor.lowPrecisionInputs = isLowPrecisionInput
+      descriptor.lowPrecisionIntermediates = isLowPrecisionInput
 
       // Create kernel descriptor
       let kernelDescriptor = descriptor.kernelDescriptor(type: .forward)
@@ -888,7 +871,7 @@ public func mfa_attention_forward(
 
       // Get the Metal function using native kernel source (no string replacement!)
       let source = kernel.createSource()
-      let library = try mfaContext.device.makeLibrary(source: source, options: nil)
+      let library = try mfaContext.device.makeLibrary(source: source, options: mfaContext.compileOptions)
       let function = try library.makeFunction(name: "attention", constantValues: constants)
 
       // Create pipeline descriptor with proper settings for Apple Silicon
@@ -917,75 +900,59 @@ public func mfa_attention_forward(
     encoder.setComputePipelineState(pipeline)
 
     // Get cached L and D buffers (avoid reallocation like native Swift)
-    guard
-      let lBuffer = mfaContext.getCachedLBuffer(seqLen: seqLenQ),
-      let dBuffer = mfaContext.getCachedDBuffer(seqLen: seqLenQ)
-    else {
+    let lElements64 = UInt64(batchSize) * UInt64(max(1, numHeads)) * UInt64(seqLenQ)
+    guard lElements64 <= UInt64(UInt32.max) else {
+      return 2 // MFA_ERROR_MEMORY_ALLOCATION
+    }
+    guard let lBuffer = mfaContext.getCachedLBuffer(seqLen: UInt32(lElements64)) else {
       return 2 // MFA_ERROR_MEMORY_ALLOCATION
     }
 
     // Note: Debug output removed - buffer copying now verified to work
 
-    // Set buffers (following MFA test pattern)
+    // Buffer binding layout must match createBufferBindings() in AttentionKernel+Source.swift.
+    // For forward non-quantized:
+    //   0-4: Q, K, V, O, L
+    //   5-7: v_block_scales, v_block_zero_points, v_precomputed_sums (dummy nil)
+    //   8-10: p_block_scales, p_block_zero_points, p_precomputed_sums (dummy nil)
+    //   11-13: k_block_scales, k_block_zero_points, k_precomputed_sums (dummy nil)
+    //   14-17: Q_strides, K_strides, V_strides, O_strides
+    //   18-21: num_heads_ptr, num_kv_heads_ptr, head_dimension_ptr, sequence_length_ptr
+    //   22-23: mask_buffer, has_mask
+
+    // Pass 1: Core operand buffers (indices 0-4)
     encoder.setBuffer(qBuffer.buffer, offset: 0, index: 0)
     encoder.setBuffer(kBuffer.buffer, offset: 0, index: 1)
     encoder.setBuffer(vBuffer.buffer, offset: 0, index: 2)
     encoder.setBuffer(outBuffer.buffer, offset: 0, index: 3)
-    encoder.setBuffer(lBuffer, offset: 0, index: 4) // L buffer (attention statistics)
-    encoder.setBuffer(dBuffer, offset: 0, index: 5) // D buffer (attention statistics)
+    encoder.setBuffer(lBuffer, offset: 0, index: 4)
 
-    // Pass stride information if available (for non-contiguous tensor support)
-    var bufferIndex = 6
+    // Pass 2: Dummy quantization parameter buffers (indices 5-13)
+    // These are declared in the kernel but not read for non-quantized inputs.
+    // Must be set to nil at the correct indices to maintain alignment.
+    for dummyIdx in 5...13 {
+      encoder.setBuffer(nil, offset: 0, index: dummyIdx)
+    }
+    var bufferIndex = 14
 
-    // Set stride buffers for Q, K, V, O if they exist
-    if qBuffer.isStrided, let qStrides = qBuffer.strides {
-      let strideBuffer = mfaContext.device.makeBuffer(
-        bytes: qStrides, length: qStrides.count * MemoryLayout<Int64>.size,
-        options: .storageModeShared
-      )
-      encoder.setBuffer(strideBuffer, offset: 0, index: bufferIndex)
-      bufferIndex += 1
-    } else {
-      encoder.setBuffer(nil, offset: 0, index: bufferIndex)
+    // Pass 3: Stride buffers for Q, K, V, O (indices 14-17)
+    let stridedTensors: [(MFABuffer, String)] = [
+      (qBuffer, "Q"), (kBuffer, "K"), (vBuffer, "V"), (outBuffer, "O")
+    ]
+    for (bufInfo, _) in stridedTensors {
+      if bufInfo.isStrided, let strides = bufInfo.strides {
+        let strideBuffer = mfaContext.device.makeBuffer(
+          bytes: strides, length: strides.count * MemoryLayout<Int64>.size,
+          options: .storageModeShared
+        )
+        encoder.setBuffer(strideBuffer, offset: 0, index: bufferIndex)
+      } else {
+        encoder.setBuffer(nil, offset: 0, index: bufferIndex)
+      }
       bufferIndex += 1
     }
 
-    if kBuffer.isStrided, let kStrides = kBuffer.strides {
-      let strideBuffer = mfaContext.device.makeBuffer(
-        bytes: kStrides, length: kStrides.count * MemoryLayout<Int64>.size,
-        options: .storageModeShared
-      )
-      encoder.setBuffer(strideBuffer, offset: 0, index: bufferIndex)
-      bufferIndex += 1
-    } else {
-      encoder.setBuffer(nil, offset: 0, index: bufferIndex)
-      bufferIndex += 1
-    }
-
-    if vBuffer.isStrided, let vStrides = vBuffer.strides {
-      let strideBuffer = mfaContext.device.makeBuffer(
-        bytes: vStrides, length: vStrides.count * MemoryLayout<Int64>.size,
-        options: .storageModeShared
-      )
-      encoder.setBuffer(strideBuffer, offset: 0, index: bufferIndex)
-      bufferIndex += 1
-    } else {
-      encoder.setBuffer(nil, offset: 0, index: bufferIndex)
-      bufferIndex += 1
-    }
-
-    if outBuffer.isStrided, let outStrides = outBuffer.strides {
-      let strideBuffer = mfaContext.device.makeBuffer(
-        bytes: outStrides, length: outStrides.count * MemoryLayout<Int64>.size,
-        options: .storageModeShared
-      )
-      encoder.setBuffer(strideBuffer, offset: 0, index: bufferIndex)
-      bufferIndex += 1
-    } else {
-      encoder.setBuffer(nil, offset: 0, index: bufferIndex)
-      bufferIndex += 1
-    }
-
+    // Pass 4: Multi-head attention parameters (indices 18-21)
     var numHeadsValue = numHeads
     encoder.setBytes(&numHeadsValue, length: MemoryLayout<UInt32>.size, index: bufferIndex)
     bufferIndex += 1
@@ -999,6 +966,7 @@ public func mfa_attention_forward(
     encoder.setBytes(&sequenceLengthValue, length: MemoryLayout<UInt32>.size, index: bufferIndex)
     bufferIndex += 1
 
+    // Pass 5: Mask buffer and flag (indices 22-23)
     if let mask = preparedMask {
       encoder.setBuffer(mask.buffer, offset: 0, index: bufferIndex)
       var hasMask: UInt32 = 1
@@ -1010,22 +978,18 @@ public func mfa_attention_forward(
     }
     bufferIndex += 2
 
-    // Buffers set: Q, K, V, O, L, D following MFA pattern
-
     // Set threadgroup memory
     encoder.setThreadgroupMemoryLength(Int(kernel.threadgroupMemoryAllocation), index: 0)
 
     // Dispatch using MFA's calculation method
+    // Kernel uses 3D grid: gid.x = sequence block, gid.y = head, gid.z = batch
     let parallelizationDimension = Int(seqLenQ)
-
-    // Use MFA's ceil divide calculation
     let blockCount =
       (parallelizationDimension + Int(kernel.blockDimensions.parallelization) - 1)
         / Int(kernel.blockDimensions.parallelization)
-    let gridSize = MTLSize(width: blockCount, height: 1, depth: 1)
+    let gridSize = MTLSize(width: blockCount, height: Int(numHeads), depth: Int(batchSize))
     let groupSize = MTLSize(width: Int(kernel.threadgroupSize), height: 1, depth: 1)
 
-    // Single dispatch for optimal performance (multiple dispatches were causing slowdown)
     encoder.dispatchThreadgroups(gridSize, threadsPerThreadgroup: groupSize)
     encoder.endEncoding()
 
@@ -1489,13 +1453,12 @@ private func mfa_attention_forward_multihead_internal(
     let swiftInputPrecision = convertCFFIPrecisionToSwift(inputPrecision)
     let swiftIntermediatePrecision = convertCFFIPrecisionToSwift(intermediatePrecision)
 
-    // IMPORTANT: When using FP16/BF16 precision modes with FP32 data,
-    // we must use FP32 inputs to avoid NaN issues from precision mismatch
-    // The inputs are always FP32 from the FFI layer
-    baseDescriptor.lowPrecisionInputs = false  // Always use FP32 inputs from FFI
-    baseDescriptor
-      // Use FP32 intermediates for numerical stability
-      .lowPrecisionIntermediates = false
+    // Match kernel input type to actual tensor storage passed from C++.
+    // If this is wrong (e.g. half data but float kernel pointers), outputs can become NaN.
+    let useLowPrecisionInputs = (swiftInputPrecision == 1 || swiftInputPrecision == 2) // FP16/BF16
+    baseDescriptor.lowPrecisionInputs = useLowPrecisionInputs
+    // Keep intermediates in FP32 for stability unless explicitly requested low precision.
+    baseDescriptor.lowPrecisionIntermediates = (swiftIntermediatePrecision == 1 || swiftIntermediatePrecision == 2)
     baseDescriptor.transposeState = (Q: transposeQ, K: transposeK, V: transposeV, O: transposeO)
     baseDescriptor.sparsityPattern = causal ? .causal : .none
     baseDescriptor.softmaxScale = softmaxScale
@@ -1620,6 +1583,7 @@ private func dequantizeBuffer(
   // Create Metal compute pipeline for dequantization with precision safety
   let compileOptions = MTLCompileOptions()
   compileOptions.fastMathEnabled = false // Disable fast math for numerical stability with BF16
+  compileOptions.languageVersion = .version3_1 // Required for bfloat type support
 
   guard
     let library = try? device.makeLibrary(source: kernelSource, options: compileOptions),
