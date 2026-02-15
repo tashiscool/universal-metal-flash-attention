@@ -1,9 +1,13 @@
 # Metal SDPA Extension — test targets
 
-PYTEST = python -m pytest
+PYTHON ?= python3
+PYTEST = $(PYTHON) -m pytest
 TEST_DIR = tests
+QWEN_ROOT ?= /Users/tkhan/qwen3-coder-next-mac
+RC3_REPORT_JSON ?= /tmp/rc3_gate_report.json
+RC3_REPORT_MD ?= /tmp/rc3_gate_report.md
 
-.PHONY: test test-gate test-gate-fast test-wan test-all
+.PHONY: test test-gate test-gate-fast test-wan test-all rc3-gate
 
 # Run all tests
 test:
@@ -24,3 +28,13 @@ test-wan:
 # Everything: all test files
 test-all:
 	$(PYTEST) $(TEST_DIR) -v --tb=long
+
+# RC3 strict comparability/perf gate for WAN soak A/B
+rc3-gate:
+	$(PYTHON) tools/rc3_harness.py \
+		--workspace-root "$(QWEN_ROOT)" \
+		--jobs 1 \
+		--baseline-threshold 32768 \
+		--candidate-threshold 1024 \
+		--output-json "$(RC3_REPORT_JSON)" \
+		--output-md "$(RC3_REPORT_MD)"
