@@ -15,6 +15,7 @@
 #include <cctype>     // For std::tolower
 #include <string>
 #include <chrono>
+#include <functional>
 
 namespace metal_sdpa {
 
@@ -1272,8 +1273,9 @@ torch::Tensor MetalSDPABackend::call_swift_flash_attention_impl(
                     "Additive mask with zero softmax scale is unsupported in native bridge; "
                     "use PyTorch fallback path");
             }
-            // Match PyTorch semantics: mask should not be multiplied by scale.
-            mask_cpu = mask_cpu / softmax_scale;
+            // Upcast to FP32 before division to avoid FP16 overflow/precision loss.
+            // softmax_scale ~0.125 means division amplifies by 8x.
+            mask_cpu = (mask_cpu.to(torch::kFloat32) / softmax_scale).to(torch::kFloat16);
             mask_type = MFA_MASK_TYPE_ADDITIVE;
             mask_scalar_type = MFA_MASK_SCALAR_FP16;
         } else if (mask_dtype == torch::kBFloat16) {
@@ -1282,8 +1284,8 @@ torch::Tensor MetalSDPABackend::call_swift_flash_attention_impl(
                     "Additive mask with zero softmax scale is unsupported in native bridge; "
                     "use PyTorch fallback path");
             }
-            // BF16 mask prep kernel produces garbage on MFA — convert to FP16.
-            mask_cpu = (mask_cpu / softmax_scale).to(torch::kFloat16);
+            // BF16 mask prep kernel produces garbage on MFA — upcast to FP32, divide, convert to FP16.
+            mask_cpu = (mask_cpu.to(torch::kFloat32) / softmax_scale).to(torch::kFloat16);
             mask_type = MFA_MASK_TYPE_ADDITIVE;
             mask_scalar_type = MFA_MASK_SCALAR_FP16;
         } else {
@@ -1400,6 +1402,20 @@ torch::Tensor MetalSDPABackend::call_swift_flash_attention_impl(
         print_strides("O", output);
     }
 
+    // RAII guard: destroy MFA buffer handles on any exit path.
+    // mfa_buffer_from_mtl_buffer / mfa_buffer_from_ptr allocate Swift wrapper
+    // objects that must be freed — without this, 4 handles leak per call.
+    auto destroy_buffers = [&]() {
+        if (q_buffer) mfa_destroy_buffer(q_buffer);
+        if (k_buffer) mfa_destroy_buffer(k_buffer);
+        if (v_buffer) mfa_destroy_buffer(v_buffer);
+        if (out_buffer) mfa_destroy_buffer(out_buffer);
+    };
+    struct _BufferGuard {
+        std::function<void()> cleanup;
+        ~_BufferGuard() { cleanup(); }
+    } buffer_guard{destroy_buffers};
+
     auto _t_bind_start = std::chrono::high_resolution_clock::now();
     bind_tensor("query", q_tensor, q_buffer);
     bind_tensor("key", k_tensor, k_buffer);
@@ -1467,10 +1483,8 @@ torch::Tensor MetalSDPABackend::call_swift_flash_attention(
     bool is_causal,
     float softmax_scale
 ) {
-    if (!env_flag_enabled("METAL_NATIVE_SDPA_ENABLED", true)) {
-        return fallback_to_native_sdpa(
-            q, k, v, attn_mask, is_causal, softmax_scale, "env_disabled");
-    }
+    // Note: METAL_NATIVE_SDPA_ENABLED is checked by the caller
+    // (scaled_dot_product_attention) — no need to double-check here.
 
     bool mps_candidate = q.device().is_mps() && k.device().is_mps() && v.device().is_mps();
     if (mps_candidate) {
@@ -2093,7 +2107,17 @@ torch::Tensor MetalSDPABackend::quantized_scaled_dot_product_attention_unified(
     torch::Tensor v_processed = v_metal;
 
     // Create MFA buffers
-    mfa_buffer_t q_buffer, k_buffer, v_buffer, out_buffer;
+    mfa_buffer_t q_buffer = nullptr, k_buffer = nullptr, v_buffer = nullptr, out_buffer = nullptr;
+    auto destroy_quant_buffers = [&]() {
+        if (q_buffer) { mfa_destroy_buffer(q_buffer); q_buffer = nullptr; }
+        if (k_buffer) { mfa_destroy_buffer(k_buffer); k_buffer = nullptr; }
+        if (v_buffer) { mfa_destroy_buffer(v_buffer); v_buffer = nullptr; }
+        if (out_buffer) { mfa_destroy_buffer(out_buffer); out_buffer = nullptr; }
+    };
+    struct _QuantBufferGuard {
+        std::function<void()> cleanup;
+        ~_QuantBufferGuard() { cleanup(); }
+    } quant_buffer_guard{destroy_quant_buffers};
 
     size_t q_bytes = q_processed.numel() * q_processed.element_size();
     size_t k_bytes = k_processed.numel() * k_processed.element_size();
@@ -2232,14 +2256,10 @@ torch::Tensor MetalSDPABackend::quantized_scaled_dot_product_attention_unified(
         // Convert to target device AFTER creating safe copy
         torch::Tensor final_result = safe_output.to(query.device());
 
-        // Now safe to clean up MFA buffers since we have an independent copy
-        VPRINTF("🧹 Skipping MFA buffer destruction (zero-copy views are owned by PyTorch)\n");
-
         fflush(stdout);
         return final_result;
 
     } catch (...) {
-        VPRINTF("🚨 Exception occurred; skipping MFA buffer destruction to avoid touching shared memory\n");
         throw;
     }
 }
