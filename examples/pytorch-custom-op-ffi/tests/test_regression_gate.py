@@ -12,6 +12,8 @@ Usage:
 
 import gc
 import os
+import subprocess
+import sys
 import time
 
 import pytest
@@ -316,3 +318,55 @@ class TestRolloutControls:
         torch.mps.synchronize()
         assert out.shape == q.shape
         assert torch.isfinite(out).all()
+
+    def test_2d_timing_enabled(self):
+        """2D inputs should remain valid with METAL_SDPA_TIMING=1 (no dim-index crash)."""
+        script = r"""
+import torch
+import metal_sdpa_extension as ext
+if not torch.backends.mps.is_available():
+    raise SystemExit(0)
+q = torch.randn(128, 64, dtype=torch.float16, device="mps") * 0.1
+k = torch.randn(128, 64, dtype=torch.float16, device="mps") * 0.1
+v = torch.randn(128, 64, dtype=torch.float16, device="mps") * 0.1
+out = ext.metal_scaled_dot_product_attention(q, k, v)
+torch.mps.synchronize()
+assert out.shape == q.shape
+assert torch.isfinite(out).all()
+print("timing_2d_ok")
+"""
+        env = os.environ.copy()
+        env["METAL_SDPA_TIMING"] = "1"
+        proc = subprocess.run(
+            [sys.executable, "-c", script],
+            env=env,
+            capture_output=True,
+            text=True,
+            timeout=60,
+        )
+        assert proc.returncode == 0, f"subprocess failed: {proc.stderr}\n{proc.stdout}"
+        assert "timing_2d_ok" in proc.stdout
+
+    def test_2d_env_disable_fallback(self, metal_device, monkeypatch):
+        """2D inputs should succeed through fallback when native backend is disabled."""
+        monkeypatch.setenv("METAL_NATIVE_SDPA_ENABLED", "0")
+
+        q = torch.randn(128, 64, dtype=torch.float16, device=metal_device) * 0.1
+        k = torch.randn(128, 64, dtype=torch.float16, device=metal_device) * 0.1
+        v = torch.randn(128, 64, dtype=torch.float16, device=metal_device) * 0.1
+
+        ref = torch.nn.functional.scaled_dot_product_attention(
+            q.float().cpu().unsqueeze(0).unsqueeze(0),
+            k.float().cpu().unsqueeze(0).unsqueeze(0),
+            v.float().cpu().unsqueeze(0).unsqueeze(0),
+        ).squeeze(0).squeeze(0)
+
+        torch.mps.synchronize()
+        out = metal_sdpa_extension.metal_scaled_dot_product_attention(q, k, v)
+        torch.mps.synchronize()
+
+        out_cpu = out.float().cpu()
+        assert out_cpu.shape == ref.shape
+        assert torch.isfinite(out_cpu).all()
+        cos = _cosine_similarity(out_cpu, ref.float())
+        assert cos >= COS_THRESH_FP16, f"2D fallback cos={cos:.6f}"
