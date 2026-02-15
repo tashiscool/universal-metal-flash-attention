@@ -15,6 +15,7 @@ import os
 import subprocess
 import sys
 import time
+from pathlib import Path
 
 import pytest
 import torch
@@ -337,6 +338,10 @@ print("timing_2d_ok")
 """
         env = os.environ.copy()
         env["METAL_SDPA_TIMING"] = "1"
+        # Run from the package root so metal_sdpa_extension.so is importable
+        # regardless of where pytest was invoked.
+        pkg_root = str(Path(__file__).resolve().parent.parent)
+        env["PYTHONPATH"] = pkg_root + os.pathsep + env.get("PYTHONPATH", "")
         proc = subprocess.run(
             [sys.executable, "-c", script],
             env=env,
