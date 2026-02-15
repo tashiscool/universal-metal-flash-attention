@@ -232,7 +232,8 @@ kernel void mfa_prepare_mask(
     batchSize: UInt32,
     numHeads: UInt32,
     seqLenQ: UInt32,
-    seqLenKV: UInt32
+    seqLenKV: UInt32,
+    commandBuffer: MTLCommandBuffer? = nil
   ) throws -> PreparedMask? {
     guard let arguments else {
       return nil
@@ -293,10 +294,20 @@ kernel void mfa_prepare_mask(
 
     let pipeline = try ensureMaskPipeline()
 
-    guard
-      let commandBuffer = commandQueue.makeCommandBuffer(),
-      let encoder = commandBuffer.makeComputeCommandEncoder()
-    else {
+    let cb: MTLCommandBuffer
+    let ownsCommandBuffer: Bool
+    if let commandBuffer {
+      cb = commandBuffer
+      ownsCommandBuffer = false
+    } else {
+      guard let newCB = commandQueue.makeCommandBuffer() else {
+        throw MaskPreparationError.commandEncodingFailed
+      }
+      cb = newCB
+      ownsCommandBuffer = true
+    }
+
+    guard let encoder = cb.makeComputeCommandEncoder() else {
       throw MaskPreparationError.commandEncodingFailed
     }
 
@@ -337,12 +348,14 @@ kernel void mfa_prepare_mask(
     encoder.dispatchThreadgroups(threadgroupCount, threadsPerThreadgroup: threadgroupSize)
     encoder.endEncoding()
 
-    commandBuffer.commit()
-    commandBuffer.waitUntilCompleted()
+    if ownsCommandBuffer {
+      cb.commit()
+      cb.waitUntilCompleted()
 
-    if let error = commandBuffer.error {
-      print("Mask kernel execution error: \(error)")
-      throw MaskPreparationError.commandExecutionFailed
+      if let error = cb.error {
+        print("Mask kernel execution error: \(error)")
+        throw MaskPreparationError.commandExecutionFailed
+      }
     }
 
     return PreparedMask(buffer: outputBuffer)
@@ -793,6 +806,10 @@ public func mfa_attention_forward(
     maskArguments = nil
   }
 
+  guard let commandBuffer = mfaContext.commandQueue.makeCommandBuffer() else {
+    return 5 // MFA_ERROR_EXECUTION_FAILED
+  }
+
   let preparedMask: PreparedMask?
   do {
     preparedMask = try mfaContext.prepareMask(
@@ -800,7 +817,8 @@ public func mfa_attention_forward(
       batchSize: batchSize,
       numHeads: numHeads,
       seqLenQ: seqLenQ,
-      seqLenKV: seqLenKV
+      seqLenKV: seqLenKV,
+      commandBuffer: commandBuffer
     )
   } catch let maskError as MFAContext.MaskPreparationError {
     switch maskError {
@@ -887,11 +905,6 @@ public func mfa_attention_forward(
 
       // Cache the compiled pipeline and kernel
       mfaContext.cachePipeline(pipeline, kernel: kernel, key: cacheKey)
-    }
-
-    // Create command buffer
-    guard let commandBuffer = mfaContext.commandQueue.makeCommandBuffer() else {
-      return 5 // MFA_ERROR_EXECUTION_FAILED
     }
 
     // Create compute encoder
